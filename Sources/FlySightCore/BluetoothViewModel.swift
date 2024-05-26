@@ -68,7 +68,7 @@ public class BluetoothViewModel: NSObject, ObservableObject {
         }
     }
 
-    public func parseDirectoryEntry(from data: Data) -> DirectoryEntry? {
+    private func parseDirectoryEntry(from data: Data) -> DirectoryEntry? {
         guard data.count == 24 else { return nil } // Ensure data length is as expected
 
         let size: UInt32 = data.subdata(in: 2..<6).withUnsafeBytes { $0.load(as: UInt32.self) }
