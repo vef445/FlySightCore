@@ -35,6 +35,12 @@ public extension FlySightCore {
 
         @Published public var isAwaitingResponse = false
 
+        public enum State {
+            case idle
+            case counting
+        }
+
+        @Published public var state: State = .idle
         @Published public var startResultDate: Date?
 
         private var timers: [UUID: Timer] = [:]
@@ -178,6 +184,19 @@ public extension FlySightCore {
             // Sending 0x00 to the control characteristic
             let startCommand = Data([0x00])
             connectedPeripheral?.peripheral.writeValue(startCommand, for: controlCharacteristic, type: .withResponse)
+            state = .counting
+        }
+
+        public func sendCancelCommand() {
+            guard let controlCharacteristic = controlCharacteristic else {
+                print("Control characteristic not found")
+                return
+            }
+
+            // Sending 0x01 to the control characteristic
+            let cancelCommand = Data([0x01])
+            connectedPeripheral?.peripheral.writeValue(cancelCommand, for: controlCharacteristic, type: .withResponse)
+            state = .idle
         }
 
         public func processStartResult(data: Data) {
@@ -212,7 +231,10 @@ public extension FlySightCore {
             }
 
             DispatchQueue.main.async {
-                self.startResultDate = date
+                if self.state == .counting {
+                    self.startResultDate = date
+                    self.state = .idle
+                }
             }
         }
     }
