@@ -1,6 +1,6 @@
 //
 //  FlySightBluetoothManager.swift
-//  
+//
 //
 //  Created by Michael Cooper on 2024-05-25.
 //
@@ -17,9 +17,15 @@ public extension FlySightCore {
 
         public let CRS_RX_UUID = CBUUID(string: "00000002-8e22-4541-9d4c-21edae82ed19")
         public let CRS_TX_UUID = CBUUID(string: "00000001-8e22-4541-9d4c-21edae82ed19")
+        public let GNSS_PV_UUID = CBUUID(string: "00000000-8e22-4541-9d4c-21edae82ed19")
+        public let START_CONTROL_UUID = CBUUID(string: "00000003-8e22-4541-9d4c-21edae82ed19")
+        public let START_RESULT_UUID = CBUUID(string: "00000004-8e22-4541-9d4c-21edae82ed19")
 
         private var rxCharacteristic: CBCharacteristic?
         private var txCharacteristic: CBCharacteristic?
+        private var pvCharacteristic: CBCharacteristic?
+        private var controlCharacteristic: CBCharacteristic?
+        private var resultCharacteristic: CBCharacteristic?
 
         @Published public var directoryEntries: [DirectoryEntry] = []
 
@@ -28,6 +34,8 @@ public extension FlySightCore {
         @Published public var currentPath: [String] = []  // Start with the root directory
 
         @Published public var isAwaitingResponse = false
+
+        @Published public var startResultDate: Date?
 
         private var timers: [UUID: Timer] = [:]
 
@@ -160,6 +168,53 @@ public extension FlySightCore {
                 self.timers.removeValue(forKey: peripheralInfo.id)
             }
         }
+
+        public func sendStartCommand() {
+            guard let controlCharacteristic = controlCharacteristic else {
+                print("Control characteristic not found")
+                return
+            }
+
+            // Sending 0x00 to the control characteristic
+            let startCommand = Data([0x00])
+            connectedPeripheral?.peripheral.writeValue(startCommand, for: controlCharacteristic, type: .withResponse)
+        }
+
+        public func processStartResult(data: Data) {
+            guard data.count == 9 else {
+                print("Invalid start result data length")
+                return
+            }
+
+            let year = data.subdata(in: 0..<2).withUnsafeBytes { $0.load(as: UInt16.self) }
+            let month = data.subdata(in: 2..<3).withUnsafeBytes { $0.load(as: UInt8.self) }
+            let day = data.subdata(in: 3..<4).withUnsafeBytes { $0.load(as: UInt8.self) }
+            let hour = data.subdata(in: 4..<5).withUnsafeBytes { $0.load(as: UInt8.self) }
+            let minute = data.subdata(in: 5..<6).withUnsafeBytes { $0.load(as: UInt8.self) }
+            let second = data.subdata(in: 6..<7).withUnsafeBytes { $0.load(as: UInt8.self) }
+            let timestampMs = data.subdata(in: 7..<9).withUnsafeBytes { $0.load(as: UInt16.self) }
+
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? TimeZone(abbreviation: "UTC")!
+
+            var components = DateComponents()
+            components.year = Int(year)
+            components.month = Int(month)
+            components.day = Int(day)
+            components.hour = Int(hour)
+            components.minute = Int(minute)
+            components.second = Int(second)
+            components.nanosecond = Int(timestampMs) * 1_000_000
+
+            guard let date = calendar.date(from: components) else {
+                print("Failed to create date from start result data")
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.startResultDate = date
+            }
+        }
     }
 }
 
@@ -215,6 +270,9 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
         // Reset the characteristic references
         rxCharacteristic = nil
         txCharacteristic = nil
+        pvCharacteristic = nil
+        controlCharacteristic = nil
+        resultCharacteristic = nil
 
         // Initialize current path
         currentPath = []
@@ -243,6 +301,8 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
                 }
                 self.isAwaitingResponse = false
             }
+        } else if characteristic.uuid == START_RESULT_UUID {
+            processStartResult(data: data)
         }
     }
 
@@ -281,6 +341,13 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
                 } else if characteristic.uuid == CRS_RX_UUID {
                     rxCharacteristic = characteristic
                     peripheral.readValue(for: characteristic)
+                } else if characteristic.uuid == GNSS_PV_UUID {
+                    pvCharacteristic = characteristic
+                } else if characteristic.uuid == START_CONTROL_UUID {
+                    controlCharacteristic = characteristic
+                } else if characteristic.uuid == START_RESULT_UUID {
+                    resultCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic)
                 }
             }
             if txCharacteristic != nil && rxCharacteristic != nil {
