@@ -1,5 +1,5 @@
 //
-//  FlySightBluetoothManager.swift
+//  BluetoothManager.swift
 //
 //
 //  Created by Michael Cooper on 2024-05-25.
@@ -12,6 +12,8 @@ import Combine
 public extension FlySightCore {
     class BluetoothManager: NSObject, ObservableObject {
         private var centralManager: CBCentralManager?
+        private var cancellables = Set<AnyCancellable>()
+        private var notificationHandlers: [CBUUID: (CBPeripheral, CBCharacteristic, Error?) -> Void] = [:]
 
         @Published public var peripheralInfos: [PeripheralInfo] = []
 
@@ -237,6 +239,74 @@ public extension FlySightCore {
                 }
             }
         }
+
+        public func downloadFile(named fileName: String, completion: @escaping (Result<Data, Error>) -> Void) {
+            guard let peripheral = connectedPeripheral?.peripheral, let rx = rxCharacteristic, let tx = txCharacteristic else {
+                completion(.failure(NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "No connected peripheral or RX characteristic"])))
+                return
+            }
+
+            var fileData = Data()
+            var nextPacketNum: UInt8 = 0
+            let transferComplete = PassthroughSubject<Void, Error>()
+
+            // Define the notification handler
+            let notifyHandler: (CBPeripheral, CBCharacteristic, Error?) -> Void = { [weak self] (peripheral, characteristic, error) in
+                guard error == nil, let data = characteristic.value else {
+                    transferComplete.send(completion: .failure(error ?? NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unknown error"])))
+                    return
+                }
+                if data[0] == 0x10 {
+                    let packetNum = data[1]
+                    if packetNum == nextPacketNum {
+                        if data.count > 2 {
+                            fileData.append(data[2...])
+                        } else {
+                            transferComplete.send(completion: .finished)
+                        }
+                        nextPacketNum = nextPacketNum &+ 1
+                        let ackPacket = Data([0x12, packetNum])
+                        peripheral.writeValue(ackPacket, for: rx, type: .withoutResponse)
+
+                        print("Received packet: \(packetNum), length \(data.count - 2)")
+                    } else {
+                        print("Out of order packet: \(packetNum)")
+                    }
+                }
+            }
+
+            // Save the handler in a dictionary to be used in didUpdateValueFor
+            notificationHandlers[tx.uuid] = notifyHandler
+
+            // Enable notifications for TX characteristic
+            peripheral.setNotifyValue(true, for: tx)
+
+            print("  Getting file \(fileName)")
+
+            // Create offset and stride bytes as per the Python script
+            let offset: UInt32 = 0
+            let stride: UInt32 = 0
+            let offsetBytes = withUnsafeBytes(of: offset.littleEndian, Array.init)
+            let strideBytes = withUnsafeBytes(of: stride.littleEndian, Array.init)
+            let command = Data([0x02]) + offsetBytes + strideBytes + fileName.data(using: .utf8)!
+
+            // Write the command to start the file transfer
+            peripheral.writeValue(command, for: rx, type: .withoutResponse)
+
+            // Subscribe to the completion of the transfer
+            let cancellable = transferComplete.sink(receiveCompletion: { result in
+                peripheral.setNotifyValue(false, for: tx)
+                self.notificationHandlers[tx.uuid] = nil // Clear the handler after use
+                switch result {
+                case .failure(let error):
+                    completion(.failure(error))
+                case .finished:
+                    completion(.success(fileData))
+                }
+            }, receiveValue: { _ in })
+
+            cancellable.store(in: &cancellables)
+        }
     }
 }
 
@@ -325,6 +395,11 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
             }
         } else if characteristic.uuid == START_RESULT_UUID {
             processStartResult(data: data)
+        }
+
+        // Handle notifications for file download
+        if let handler = notificationHandlers[characteristic.uuid] {
+            handler(peripheral, characteristic, error)
         }
     }
 
