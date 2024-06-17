@@ -47,6 +47,9 @@ public extension FlySightCore {
 
         private var timers: [UUID: Timer] = [:]
 
+        @Published public var downloadProgress: Float = 0.0
+        private var currentFileSize: UInt32 = 0
+
         public override init() {
             super.init()
             self.centralManager = CBCentralManager(delegate: self, queue: .main)
@@ -240,7 +243,7 @@ public extension FlySightCore {
             }
         }
 
-        public func downloadFile(named fileName: String, completion: @escaping (Result<Data, Error>) -> Void) {
+        public func downloadFile(named filePath: String, completion: @escaping (Result<Data, Error>) -> Void) {
             guard let peripheral = connectedPeripheral?.peripheral, let rx = rxCharacteristic, let tx = txCharacteristic else {
                 completion(.failure(NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "No connected peripheral or RX characteristic"])))
                 return
@@ -249,6 +252,16 @@ public extension FlySightCore {
             var fileData = Data()
             var nextPacketNum: UInt8 = 0
             let transferComplete = PassthroughSubject<Void, Error>()
+
+            // Extract the file name from the full path
+            let fileName = (filePath as NSString).lastPathComponent
+
+            // Set the current file size (assuming you know it here)
+            if let fileEntry = directoryEntries.first(where: { $0.name == fileName }) {
+                currentFileSize = fileEntry.size
+            } else {
+                currentFileSize = 0  // Fallback to 0 if file size is unknown
+            }
 
             // Define the notification handler
             let notifyHandler: (CBPeripheral, CBCharacteristic, Error?) -> Void = { [weak self] (peripheral, characteristic, error) in
@@ -269,6 +282,14 @@ public extension FlySightCore {
                         peripheral.writeValue(ackPacket, for: rx, type: .withoutResponse)
 
                         print("Received packet: \(packetNum), length \(data.count - 2)")
+
+                        // Update the download progress
+                        if let fileSize = self?.currentFileSize {
+                            let progress = Float(fileData.count) / Float(fileSize)
+                            DispatchQueue.main.async {
+                                self?.downloadProgress = progress
+                            }
+                        }
                     } else {
                         print("Out of order packet: \(packetNum)")
                     }
@@ -281,14 +302,14 @@ public extension FlySightCore {
             // Enable notifications for TX characteristic
             peripheral.setNotifyValue(true, for: tx)
 
-            print("  Getting file \(fileName)")
+            print("  Getting file \(filePath)")
 
             // Create offset and stride bytes as per the Python script
             let offset: UInt32 = 0
             let stride: UInt32 = 0
             let offsetBytes = withUnsafeBytes(of: offset.littleEndian, Array.init)
             let strideBytes = withUnsafeBytes(of: stride.littleEndian, Array.init)
-            let command = Data([0x02]) + offsetBytes + strideBytes + fileName.data(using: .utf8)!
+            let command = Data([0x02]) + offsetBytes + strideBytes + filePath.data(using: .utf8)!
 
             // Write the command to start the file transfer
             peripheral.writeValue(command, for: rx, type: .withoutResponse)
@@ -306,6 +327,18 @@ public extension FlySightCore {
             }, receiveValue: { _ in })
 
             cancellable.store(in: &cancellables)
+        }
+
+        public func cancelDownload() {
+            guard let rx = rxCharacteristic else {
+                print("RX characteristic not found")
+                return
+            }
+
+            // Sending 0xFF to the RX characteristic
+            let cancelCommand = Data([0xFF])
+            connectedPeripheral?.peripheral.writeValue(cancelCommand, for: rx, type: .withoutResponse)
+            state = .idle
         }
     }
 }
