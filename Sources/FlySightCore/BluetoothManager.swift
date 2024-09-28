@@ -59,7 +59,7 @@ public extension FlySightCore {
         private var lastPacketNum: Int?          // Sequence number after the last packet
         private let windowLength: Int = 8         // Window size
         private let frameLength: Int = 242        // Size of each data frame
-        private let TX_TIMEOUT: TimeInterval = 0.2 // Timeout for acknowledgments in seconds
+        private let TX_TIMEOUT: TimeInterval = 1.0 // Timeout for acknowledgments in seconds
         private var totalPackets: UInt32 = 0      // Total number of packets to send
         private var uploadTask: Task<Void, Never>? // Task for the main upload loop
         private var ackReceived = PassthroughSubject<Int, Never>() // Publisher for received ACKs
