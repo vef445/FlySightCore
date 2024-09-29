@@ -639,36 +639,42 @@ public extension FlySightCore {
         }
 
         private func sendPacket(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic) {
-            guard let fileData = fileDataToUpload, nextPacketNum < (lastPacketNum ?? Int.max) else {
-                print("No more packets to send or upload not initialized.")
+            guard let fileData = fileDataToUpload else {
+                print("No file data to send.")
                 return
             }
 
             let startIndex = nextPacketNum * frameLength
             let endIndex = min(startIndex + frameLength, fileData.count)
-            let dataSlice = fileData[startIndex..<endIndex]
 
-            // Construct the packet: [0x10][Packet Number][Data...]
-            var packetData = Data()
-            packetData.append(0x10) // 0x10 signifies the start of a data packet
-            packetData.append(UInt8(nextPacketNum % 256)) // Packet number modulo 256
-            packetData.append(dataSlice) // Actual data
+            if startIndex < fileData.count {
+                // Send Data Packet
+                let dataSlice = fileData[startIndex..<endIndex]
 
-            // **Logging the First 10 Bytes**
-            let first10Bytes = packetData.prefix(10)
-            let hexString = first10Bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
-            print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
-            print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
+                // Construct the packet: [0x10][Packet Number][Data...]
+                var packetData = Data()
+                packetData.append(0x10) // 0x10 signifies the start of a data packet
+                packetData.append(UInt8(nextPacketNum % 256)) // Packet number modulo 256
+                packetData.append(dataSlice) // Actual data
 
-            // Write the data packet with .withoutResponse
-            peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
-            print("Packet \(nextPacketNum) sent.")
+                // **Logging the First 10 Bytes**
+                let first10Bytes = packetData.prefix(10)
+                let hexString = first10Bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+                print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
 
-            // Check if this is the last packet
-            if endIndex >= fileData.count {
-                // No more data to send; set lastPacketNum
+                // Write the data packet with .withoutResponse
+                peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
+                print("Packet \(nextPacketNum) sent.")
+            }
+            else {
+                // Send Final Empty Packet
+                let packetData = Data([0x10, UInt8(nextPacketNum % 256)]) // [0x10][Packet Number]
+                peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
+                print("Sending final empty packet \(nextPacketNum): \(packetData as NSData)")
+
+                // Now, set lastPacketNum after sending the empty packet
                 lastPacketNum = nextPacketNum + 1
-                print("Last packet number set to \(lastPacketNum!)")
+                print("Final empty packet sent. Setting lastPacketNum to \(lastPacketNum!)")
             }
 
             // Increment the packet number
