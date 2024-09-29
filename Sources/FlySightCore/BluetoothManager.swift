@@ -75,7 +75,14 @@ public extension FlySightCore {
 
         public func sortPeripheralsByRSSI() {
             DispatchQueue.main.async {
-                self.peripheralInfos.sort { $0.rssi > $1.rssi }
+                self.peripheralInfos.sort {
+                    // First, sort by pairing mode: true comes before false
+                    if $0.isPairingMode != $1.isPairingMode {
+                        return $0.isPairingMode && !$1.isPairingMode
+                    }
+                    // If both have the same pairing mode status, sort by RSSI descending
+                    return $0.rssi > $1.rssi
+                }
             }
         }
 
@@ -719,34 +726,40 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
         DispatchQueue.main.async {
             let isBonded = self.bondedDeviceIDs.contains(peripheral.identifier)
             var shouldAdd = isBonded
+            var isPairingMode = false
 
             if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data, manufacturerData.count >= 3 {
                 let manufacturerId = (UInt16(manufacturerData[1]) << 8) | UInt16(manufacturerData[0])
                 if manufacturerId == 0x09DB {
                     shouldAdd = true
-
-                    // Determine the mode based on the flags
-                    if (manufacturerData[2] & 0x01) != 0 {
-                        print("Peripheral \(peripheral.name ?? "unknown") is in pairing request mode")
-                    } else {
-                        print("Peripheral \(peripheral.name ?? "unknown") is in default mode")
-                    }
+                    isPairingMode = (manufacturerData[2] & 0x01) != 0
                 }
             }
 
             if shouldAdd {
                 if let index = self.peripheralInfos.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier }) {
+                    // Update existing PeripheralInfo
                     self.peripheralInfos[index].rssi = RSSI.intValue
+                    self.peripheralInfos[index].isPairingMode = isPairingMode
                     if !isBonded {  // Only reset timer for non-bonded devices
                         self.resetTimer(for: self.peripheralInfos[index])
                     }
                 } else {
-                    let newPeripheralInfo = FlySightCore.PeripheralInfo(peripheral: peripheral, rssi: RSSI.intValue, name: peripheral.name ?? "Unnamed Device", isConnected: false)
+                    // Create and add new PeripheralInfo
+                    let newPeripheralInfo = FlySightCore.PeripheralInfo(
+                        peripheral: peripheral,
+                        rssi: RSSI.intValue,
+                        name: peripheral.name ?? "Unnamed Device",
+                        isConnected: false,
+                        isPairingMode: isPairingMode
+                    )
                     self.peripheralInfos.append(newPeripheralInfo)
                     if !isBonded {
                         self.startDisappearanceTimer(for: newPeripheralInfo)
                     }
                 }
+                // Sort peripherals after adding/updating
+                self.sortPeripheralsByRSSI()
             }
         }
     }
@@ -759,6 +772,17 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
 
         // Optionally start discovering services or characteristics here
         peripheral.discoverServices(nil)  // Passing nil will discover all services
+
+        // Update isPairingMode flag and isConnected status
+        if let index = peripheralInfos.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier }) {
+            peripheralInfos[index].isPairingMode = false  // Clear pairing mode flag
+            peripheralInfos[index].isConnected = true      // Update connection status
+
+            // Optionally, you might want to perform additional actions here, such as notifying other parts of your app
+        }
+
+        // Re-sort the peripherals list to reflect the updated pairing mode status
+        sortPeripheralsByRSSI()
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
