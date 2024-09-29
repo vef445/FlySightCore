@@ -489,9 +489,21 @@ public extension FlySightCore {
         private func startFileTransferLoop(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic, txCharacteristic: CBCharacteristic) {
             // Initialize the upload task
             uploadTask = Task {
-                while isUploading {
-                    // Send packets within the window, with delays
-                    await self.sendPacketsWithinWindow(peripheral: peripheral, rxCharacteristic: rxCharacteristic)
+                while isUploading && !Task.isCancelled {
+                    do {
+                        // Attempt to send packets within the window
+                        try await self.sendPacketsWithinWindow(peripheral: peripheral, rxCharacteristic: rxCharacteristic)
+                    } catch {
+                        if error is CancellationError {
+                            print("Upload task cancelled.")
+                            break // Exit the loop on cancellation
+                        } else {
+                            print("Caught error: \(error.localizedDescription)")
+                            print("Resending window starting at packet \(nextAckNum)")
+                            // Reset nextPacketNum to nextAckNum to resend the window
+                            nextPacketNum = nextAckNum
+                        }
+                    }
 
                     // Wait for an acknowledgment or timeout
                     do {
@@ -519,6 +531,10 @@ public extension FlySightCore {
                             }
                         }
                     } catch {
+                        if error is CancellationError {
+                            print("Upload task cancelled.")
+                            break // Exit the loop on cancellation
+                        }
                         print("Caught error: \(error.localizedDescription)")
                         print("Resending window starting at packet \(nextAckNum)")
                         // Reset nextPacketNum to nextAckNum to resend the window
@@ -530,50 +546,53 @@ public extension FlySightCore {
 
         private func awaitFirstMatchingAck() async throws -> Int {
             try await withCheckedThrowingContinuation { continuation in
-                // Declare 'cancellable' as an optional variable
-                var cancellable: AnyCancellable?
-
-                // Assign the sink to 'cancellable' after declaring it
-                cancellable = self.ackReceived
+                // Subscribe to the ackReceived publisher
+                let cancellable = self.ackReceived
                     .filter { $0 >= self.nextAckNum }
                     .first()
                     .sink(receiveCompletion: { completionResult in
                         if case .failure(let error) = completionResult {
-                            print("awaitFirstMatchingAck: Completion with error: \(error.localizedDescription)")
-                            // Resume the continuation with an error
                             continuation.resume(throwing: error)
-                            // Remove the cancellable from the set
-                            if let cancellable = cancellable {
-                                self.continuationCancellables.remove(cancellable)
-                            }
                         }
                     }, receiveValue: { ackNum in
-                        print("awaitFirstMatchingAck: Received valid ACK: \(ackNum)")
-                        // Resume the continuation with the received ACK number
                         continuation.resume(returning: ackNum)
-                        // Remove the cancellable from the set
-                        if let cancellable = cancellable {
-                            self.continuationCancellables.remove(cancellable)
-                        }
                     })
 
-                // Retain the cancellable until the continuation is resumed
-                if let cancellable = cancellable {
-                    self.continuationCancellables.insert(cancellable)
-                    print("awaitFirstMatchingAck: Cancellable retained.")
+                // Retain the cancellable to prevent it from being deallocated
+                self.continuationCancellables.insert(cancellable)
+
+                // Handle task cancellation
+                Task {
+                    // Await until the task is canceled
+                    try await Task.sleep(nanoseconds: UInt64.max)
+                    // If the task is canceled, resume the continuation with a CancellationError
+                    continuation.resume(throwing: CancellationError())
                 }
             }
         }
 
-        private func sendPacketsWithinWindow(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic) async {
+        private func sendPacketsWithinWindow(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic) async throws {
             while nextPacketNum < nextAckNum + windowLength && (lastPacketNum == nil || nextPacketNum < lastPacketNum!) {
+                // Check if the upload is still active
+                if !isUploading || fileDataToUpload == nil {
+                    print("No more packets to send or upload not initialized.")
+                    throw CancellationError()
+                }
+
+                // Send the packet
                 sendPacket(peripheral: peripheral, rxCharacteristic: rxCharacteristic)
+
                 // Introduce a small non-blocking delay
                 do {
                     try await Task.sleep(nanoseconds: 50_000_000) // 50 milliseconds
                 } catch {
-                    print("Sleep interrupted: \(error.localizedDescription)")
-                    // Handle interruption if necessary
+                    if error is CancellationError {
+                        print("Sleep interrupted: The operation couldn’t be completed. (Swift.CancellationError error 1.)")
+                    } else {
+                        print("Sleep interrupted: \(error.localizedDescription)")
+                    }
+                    // Re-throw the error to propagate cancellation
+                    throw error
                 }
             }
         }
