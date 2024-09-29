@@ -67,6 +67,10 @@ public extension FlySightCore {
         private var continuationCancellables: Set<AnyCancellable> = []
         private var uploadCompletion: ((Result<Void, Error>) -> Void)?
 
+        // Resumption flag and lock to prevent multiple resumptions
+        private let ackContinuationLock = DispatchQueue(label: "com.flysight.bluetoothmanager.ackContinuationLock")
+        private var isContinuationResumed = false
+
         public override init() {
             super.init()
             self.centralManager = CBCentralManager(delegate: self, queue: .main)
@@ -416,7 +420,7 @@ public extension FlySightCore {
                     print("Received ACK for packet \(ackNum)")
 
                     // Check if the ACK is for the expected packet
-                    if ackNum == self.nextAckNum % 256		 {
+                    if ackNum == self.nextAckNum % 256 {
                         self.nextAckNum += 1
                         self.uploadProgress = Float(self.nextAckNum) / Float(self.totalPackets)
                         print("Updated nextAckNum to \(self.nextAckNum), uploadProgress: \(self.uploadProgress * 100)%")
@@ -424,13 +428,11 @@ public extension FlySightCore {
                         // Check if all packets have been acknowledged
                         if let lastPacket = self.lastPacketNum, self.nextAckNum >= lastPacket {
                             print("All packets acknowledged. Upload complete.")
+                            self.uploadCompletion?(.success(()))
                             self.isUploading = false
                             self.uploadTask?.cancel()
+                            self.notificationHandlers[self.txCharacteristic?.uuid ?? CBUUID()] = nil
                             self.resetUploadState()
-                            if let txUUID = self.txCharacteristic?.uuid {
-                                self.notificationHandlers[txUUID] = nil
-                            }
-                            self.uploadCompletion?(.success(()))
                         }
                     } else {
                         print("Received out-of-order ACK: \(ackNum). Expected: \(self.nextAckNum)")
@@ -489,6 +491,7 @@ public extension FlySightCore {
         private func startFileTransferLoop(peripheral: CBPeripheral, rxCharacteristic: CBCharacteristic, txCharacteristic: CBCharacteristic) {
             // Initialize the upload task
             uploadTask = Task {
+                var uploadSucceeded = false
                 while isUploading && !Task.isCancelled {
                     do {
                         // Attempt to send packets within the window
@@ -541,6 +544,19 @@ public extension FlySightCore {
                         nextPacketNum = nextAckNum
                     }
                 }
+
+                // After exiting the loop, determine the outcome
+                if uploadSucceeded {
+                    print("Upload completed successfully.")
+                    self.uploadCompletion?(.success(()))
+                } else {
+                    print("Upload was cancelled or failed.")
+                    // uploadCompletion should have been called in cancelUpload or error handling
+                }
+
+                // Clean up
+                self.uploadTask?.cancel()
+                self.resetUploadState()
             }
         }
 
@@ -550,12 +566,28 @@ public extension FlySightCore {
                 let cancellable = self.ackReceived
                     .filter { $0 >= self.nextAckNum }
                     .first()
-                    .sink(receiveCompletion: { completionResult in
-                        if case .failure(let error) = completionResult {
-                            continuation.resume(throwing: error)
+                    .sink(receiveCompletion: { [weak self] completion in
+                        guard let self = self else { return }
+                        self.ackContinuationLock.sync {
+                            if !self.isContinuationResumed {
+                                self.isContinuationResumed = true
+                                switch completion {
+                                case .finished:
+                                    // No action needed
+                                    break
+                                case .failure(let error):
+                                    continuation.resume(throwing: error)
+                                }
+                            }
                         }
-                    }, receiveValue: { ackNum in
-                        continuation.resume(returning: ackNum)
+                    }, receiveValue: { [weak self] ackNum in
+                        guard let self = self else { return }
+                        self.ackContinuationLock.sync {
+                            if !self.isContinuationResumed {
+                                self.isContinuationResumed = true
+                                continuation.resume(returning: ackNum)
+                            }
+                        }
                     })
 
                 // Retain the cancellable to prevent it from being deallocated
@@ -563,10 +595,19 @@ public extension FlySightCore {
 
                 // Handle task cancellation
                 Task {
-                    // Await until the task is canceled
-                    try await Task.sleep(nanoseconds: UInt64.max)
-                    // If the task is canceled, resume the continuation with a CancellationError
-                    continuation.resume(throwing: CancellationError())
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64.max)
+                        // This will never be called normally
+                    } catch {
+                        // Task was canceled
+                        self.ackContinuationLock.sync {
+                            if !self.isContinuationResumed {
+                                self.isContinuationResumed = true
+                                cancellable.cancel()
+                                continuation.resume(throwing: CancellationError())
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -617,6 +658,7 @@ public extension FlySightCore {
             let first10Bytes = packetData.prefix(10)
             let hexString = first10Bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
             print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
+            print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
 
             // Write the data packet with .withoutResponse
             peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
@@ -634,16 +676,18 @@ public extension FlySightCore {
         }
 
         private func resetUploadState() {
-            fileDataToUpload = nil
-            remotePathToUpload = nil
-            nextPacketNum = 0
-            nextAckNum = 0
-            lastPacketNum = nil
-            uploadProgress = 0.0
-            uploadTask = nil
-            uploadCancellable?.cancel()
-            uploadCancellable = nil
-            uploadCompletion = nil // Reset the completion handler
+            DispatchQueue.main.async {
+                self.fileDataToUpload = nil
+                self.remotePathToUpload = nil
+                self.nextPacketNum = 0
+                self.nextAckNum = 0
+                self.lastPacketNum = nil
+                self.uploadProgress = 0.0
+                self.uploadTask = nil
+                self.uploadCancellable?.cancel()
+                self.uploadCancellable = nil
+                self.uploadCompletion = nil // Reset the completion handler
+            }
         }
 
         public func cancelUpload() {
