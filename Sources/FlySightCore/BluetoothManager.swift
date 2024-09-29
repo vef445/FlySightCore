@@ -66,7 +66,6 @@ public extension FlySightCore {
         private var uploadCancellable: AnyCancellable?
         private var continuationCancellables: Set<AnyCancellable> = []
         private var uploadCompletion: ((Result<Void, Error>) -> Void)?
-        private var createAckReceived = PassthroughSubject<Void, Never>()
 
         public override init() {
             super.init()
@@ -393,71 +392,19 @@ public extension FlySightCore {
             // Set up the notification handler
             setupNotificationHandler(for: tx)
 
-            // Convert remote path to bytes
+            // Send upload command
             guard let remotePathData = remotePath.data(using: .utf8) else {
                 completion(.failure(NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to encode remote path."])))
                 return
             }
 
-            // Create the file
-            let command = Data([0x00]) + remotePathData // 0x00: Create command
-            print("Sending create command: \(command as NSData)")
+            let command = Data([0x03]) + remotePathData // 0x03: Upload command
+            print("Sending upload command: \(command as NSData)")
             peripheral.writeValue(command, for: rx, type: .withoutResponse)
 
-            // Await create command ACK
-            Task {
-                do {
-                    try await self.awaitCreateAck()
-                    print("Create command acknowledged. Starting file transfer loop.")
-
-                    let command = Data([0x03]) + remotePathData // 0x03: Upload command
-                    print("Sending upload command: \(command as NSData)")
-                    peripheral.writeValue(command, for: rx, type: .withoutResponse)
-
-                    // Start the main transfer loop
-                    print("Upload command sent. Starting file transfer loop.")
-                    startFileTransferLoop(peripheral: peripheral, rxCharacteristic: rx, txCharacteristic: tx)
-                } catch {
-                    print("Failed to receive create command ACK: \(error.localizedDescription)")
-                    self.cancelUpload()
-                    self.uploadCompletion?(.failure(error))
-                }
-            }
-        }
-
-        private func awaitCreateAck() async throws {
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await withCheckedThrowingContinuation { continuation in
-                        // Subscribe to createAckReceived
-                        let cancellable = self.createAckReceived
-                            .first()
-                            .sink(receiveCompletion: { completionResult in
-                                if case .failure(let error) = completionResult {
-                                    continuation.resume(throwing: error)
-                                }
-                            }, receiveValue: { _ in
-                                continuation.resume()
-                            })
-
-                        // Retain the cancellable until the continuation is resumed
-                        self.continuationCancellables.insert(cancellable)
-                    }
-                }
-
-                group.addTask {
-                    // Define your timeout duration (e.g., 5 seconds)
-                    try await Task.sleep(nanoseconds: UInt64(5 * 1_000_000_000))
-                    throw NSError(domain: "FlySightCore", code: -1, userInfo: [NSLocalizedDescriptionKey: "Create command ACK timeout"])
-                }
-
-                // Wait for either the ACK or the timeout
-                let result = try await group.next()!
-                group.cancelAll()
-
-                // If the ACK task completes first, do nothing (the task group will exit successfully)
-                // If the timeout task completes first, it throws an error
-            }
+            // Start the main transfer loop
+            print("Upload command sent. Starting file transfer loop.")
+            startFileTransferLoop(peripheral: peripheral, rxCharacteristic: rx, txCharacteristic: tx)
         }
 
         private func setupAckHandler() {
@@ -519,11 +466,6 @@ public extension FlySightCore {
                     let ackNum = Int(data[1])
                     print("Received Data ACK for packet \(ackNum)")
                     self.ackReceived.send(ackNum)
-                }
-                // Handle File Create ACK (e.g., 0xf100)
-                else if data.count == 2 && data[0] == 0xf1 && data[1] == 0x00 {
-                    print("Received File Create ACK")
-                    self.createAckReceived.send()
                 }
                 // Handle Directory Entry (assuming fixed length, e.g., 24 bytes)
                 else if data.count == 24 {
