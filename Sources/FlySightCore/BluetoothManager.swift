@@ -724,6 +724,13 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
                 let manufacturerId = (UInt16(manufacturerData[1]) << 8) | UInt16(manufacturerData[0])
                 if manufacturerId == 0x09DB {
                     shouldAdd = true
+
+                    // Determine the mode based on the flags
+                    if (manufacturerData[2] & 0x01) != 0 {
+                        print("Peripheral \(peripheral.name ?? "unknown") is in pairing request mode")
+                    } else {
+                        print("Peripheral \(peripheral.name ?? "unknown") is in default mode")
+                    }
                 }
             }
 
