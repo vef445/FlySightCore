@@ -71,6 +71,8 @@ public extension FlySightCore {
         private let ackContinuationLock = DispatchQueue(label: "com.flysight.bluetoothmanager.ackContinuationLock")
         private var isContinuationResumed = false
 
+        private var pingTimer: Timer?
+
         public override init() {
             super.init()
             self.centralManager = CBCentralManager(delegate: self, queue: .main)
@@ -662,7 +664,7 @@ public extension FlySightCore {
                 let hexString = first10Bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
                 print("Sending packet \(nextPacketNum): first 10 bytes: \(hexString)")
 
-                // Write the data packet with .withoutResponse
+                // Write the data packet with .withoutResponse	
                 peripheral.writeValue(packetData, for: rxCharacteristic, type: .withoutResponse)
                 print("Packet \(nextPacketNum) sent.")
             }
@@ -722,6 +724,33 @@ public extension FlySightCore {
 
             // Reset upload state
             resetUploadState()
+        }
+
+        private func startPingTimer() {
+            stopPingTimer() // Ensure any existing timer is stopped
+            DispatchQueue.main.async {
+                self.pingTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] timer in
+                    self?.sendPing()
+                }
+                print("Ping timer started")
+            }
+        }
+
+        private func stopPingTimer() {
+            DispatchQueue.main.async {
+                self.pingTimer?.invalidate()
+                self.pingTimer = nil
+            }
+        }
+
+        private func sendPing() {
+            guard let rx = rxCharacteristic else {
+                print("RX characteristic not found")
+                return
+            }
+            let pingCommand = Data([0xFE])
+            connectedPeripheral?.peripheral.writeValue(pingCommand, for: rx, type: .withoutResponse)
+            print("Ping sent")
         }
     }
 }
@@ -805,6 +834,9 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
         pvCharacteristic = nil
         controlCharacteristic = nil
         resultCharacteristic = nil
+
+        // Stop the ping timer
+        stopPingTimer()
 
         // Initialize current path
         currentPath = []
@@ -921,8 +953,9 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
                     peripheral.setNotifyValue(true, for: characteristic)
                 }
             }
-            if txCharacteristic != nil && rxCharacteristic != nil {
+            if txCharacteristic != nil && rxCharacteristic != nil && pingTimer == nil {
                 loadDirectoryEntries()
+                startPingTimer()
             }
         }
     }
