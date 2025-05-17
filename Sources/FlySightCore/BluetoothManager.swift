@@ -22,12 +22,14 @@ public extension FlySightCore {
         public let GNSS_PV_UUID = CBUUID(string: "00000000-8e22-4541-9d4c-21edae82ed19")
         public let START_CONTROL_UUID = CBUUID(string: "00000003-8e22-4541-9d4c-21edae82ed19")
         public let START_RESULT_UUID = CBUUID(string: "00000004-8e22-4541-9d4c-21edae82ed19")
+        public let GNSS_CONTROL_UUID = CBUUID(string: "00000006-8e22-4541-9d4c-21edae82ed19")
 
         private var rxCharacteristic: CBCharacteristic?
         private var txCharacteristic: CBCharacteristic?
         private var pvCharacteristic: CBCharacteristic?
         private var controlCharacteristic: CBCharacteristic?
         private var resultCharacteristic: CBCharacteristic?
+        private var gnssControlCharacteristic: CBCharacteristic?
 
         @Published public var directoryEntries: [DirectoryEntry] = []
 
@@ -72,6 +74,10 @@ public extension FlySightCore {
         private var isContinuationResumed = false
 
         private var pingTimer: Timer?
+
+        @Published public var liveGNSSData: FlySightCore.LiveGNSSData?
+        @Published public var currentGNSSMask: UInt8 = FlySightCore.GNSSLiveMaskBits.timeOfWeek | FlySightCore.GNSSLiveMaskBits.position | FlySightCore.GNSSLiveMaskBits.velocity // Default: 0xB0
+        @Published public var gnssMaskUpdateStatus: FlySightCore.GNSSMaskUpdateStatus = .idle
 
         public override init() {
             super.init()
@@ -834,6 +840,7 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
         pvCharacteristic = nil
         controlCharacteristic = nil
         resultCharacteristic = nil
+        gnssControlCharacteristic = nil
 
         // Stop the ping timer
         stopPingTimer()
@@ -869,6 +876,10 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
             }
         } else if characteristic.uuid == START_RESULT_UUID {
             processStartResult(data: data)
+        } else if characteristic.uuid == GNSS_PV_UUID {
+            parseLiveGNSSData(from: data)
+        } else if characteristic.uuid == GNSS_CONTROL_UUID {
+            processGNSSControlResponse(from: data)
         }
 
         // Handle notifications for file download
@@ -946,16 +957,25 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
                     peripheral.readValue(for: characteristic)
                 } else if characteristic.uuid == GNSS_PV_UUID {
                     pvCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Enable notifications for PV
+                    print("GNSS PV Characteristic found: \(characteristic.uuid)")
                 } else if characteristic.uuid == START_CONTROL_UUID {
                     controlCharacteristic = characteristic
                 } else if characteristic.uuid == START_RESULT_UUID {
                     resultCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic)
+                } else if characteristic.uuid == GNSS_CONTROL_UUID { // Add this block
+                    gnssControlCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Enable notifications for GNSS Control
+                    print("GNSS Control Characteristic found: \(characteristic.uuid)")
+                    // Optionally, fetch the current mask once connected and characteristic is found
+                    // fetchGNSSMask() // Consider calling this after all essential characteristics are found
                 }
             }
-            if txCharacteristic != nil && rxCharacteristic != nil && pingTimer == nil {
+            if txCharacteristic != nil && rxCharacteristic != nil && pvCharacteristic != nil && gnssControlCharacteristic != nil && pingTimer == nil {
                 loadDirectoryEntries()
                 startPingTimer()
+                fetchGNSSMask() // Good place to fetch initial mask
             }
         }
     }
@@ -983,5 +1003,182 @@ extension FlySightCore.BluetoothManager {
         var currentBonded = bondedDeviceIDs
         currentBonded.remove(peripheral.identifier)
         bondedDeviceIDs = currentBonded
+    }
+}
+
+extension FlySightCore.BluetoothManager {
+    public func fetchGNSSMask() {
+        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = gnssControlCharacteristic else {
+            print("Cannot fetch GNSS mask: No connected peripheral or GNSS Control characteristic.")
+            gnssMaskUpdateStatus = .failure("GNSS Control characteristic not available.")
+            return
+        }
+
+        let command = Data([FlySightCore.GNSSControlOpcodes.getMask])
+        print("Fetching GNSS Mask...")
+        gnssMaskUpdateStatus = .pending
+        peripheral.writeValue(command, for: controlChar, type: .withResponse) // Or .withoutResponse if firmware doesn't write back for reads this way
+    }
+
+    public func updateGNSSMask(newMask: UInt8) {
+        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = gnssControlCharacteristic else {
+            print("Cannot update GNSS mask: No connected peripheral or GNSS Control characteristic.")
+            gnssMaskUpdateStatus = .failure("GNSS Control characteristic not available.")
+            return
+        }
+
+        let command = Data([FlySightCore.GNSSControlOpcodes.setMask, newMask])
+        print("Updating GNSS Mask to: \(String(format: "0x%02X", newMask))")
+        gnssMaskUpdateStatus = .pending
+        peripheral.writeValue(command, for: controlChar, type: .withResponse) // Or .withoutResponse if firmware confirms via notification
+    }
+
+    private func parseLiveGNSSData(from data: Data) {
+        guard data.count > 0 else {
+            print("Received empty GNSS PV data.")
+            return
+        }
+
+        var offset = 0
+        let receivedMask = data[offset]; offset += 1
+        // print("Received GNSS Live Data with mask: \(String(format: "0x%02X", receivedMask))")
+
+        var tow: UInt32?
+        // var week: UInt16? // Not in current firmware packet
+        var lon: Int32?
+        var lat: Int32?
+        var hMSL: Int32?
+        var velN: Int32?
+        var velE: Int32?
+        var velD: Int32?
+        var hAcc: UInt32?
+        var vAcc: UInt32?
+        var sAcc: UInt32?
+        var numSV: UInt8?
+
+        if (receivedMask & FlySightCore.GNSSLiveMaskBits.timeOfWeek != 0) {
+            guard data.count >= offset + 4 else { return }
+            tow = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            offset += 4
+        }
+
+        // Week number is part of the mask definition but not included in the current firmware's GNSS_PV payload.
+        // if (receivedMask & FlySightCore.GNSSLiveMaskBits.weekNumber != 0) {
+        //     guard data.count >= offset + 2 else { return }
+        //     week = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self) }
+        //     offset += 2
+        // }
+
+        if (receivedMask & FlySightCore.GNSSLiveMaskBits.position != 0) {
+            guard data.count >= offset + 12 else { return }
+            lon = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            offset += 4
+            lat = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            offset += 4
+            hMSL = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            offset += 4
+        }
+
+        if (receivedMask & FlySightCore.GNSSLiveMaskBits.velocity != 0) {
+            guard data.count >= offset + 12 else { return }
+            velN = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            offset += 4
+            velE = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            offset += 4
+            velD = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: Int32.self) }
+            offset += 4
+        }
+
+        if (receivedMask & FlySightCore.GNSSLiveMaskBits.accuracy != 0) {
+            guard data.count >= offset + 12 else { return }
+            // Note: Firmware `GNSS_BLE_Build` for accuracy seems to copy velN, velE, velD again.
+            // This should be src->hAcc, src->vAcc, src->sAcc. Assuming firmware gets fixed or use as is.
+            // For now, parsing as if they are hAcc, vAcc, sAcc.
+            hAcc = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            offset += 4
+            vAcc = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            offset += 4
+            sAcc = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self) }
+            offset += 4
+        }
+
+        if (receivedMask & FlySightCore.GNSSLiveMaskBits.numSV != 0) {
+            guard data.count >= offset + 1 else { return }
+            // Note: Firmware `GNSS_BLE_Build` for numSV seems to copy velN.
+            // This should be src->numSV. Assuming firmware gets fixed or use as is.
+            numSV = data[offset] // Assuming it's a UInt8
+            offset += 1
+        }
+
+        DispatchQueue.main.async {
+            self.liveGNSSData = FlySightCore.LiveGNSSData(mask: receivedMask,
+                                                          timeOfWeek: tow,
+                                                          longitude: lon, latitude: lat, heightMSL: hMSL,
+                                                          velocityNorth: velN, velocityEast: velE, velocityDown: velD,
+                                                          horizontalAccuracy: hAcc, verticalAccuracy: vAcc, speedAccuracy: sAcc,
+                                                          numSV: numSV)
+        }
+    }
+
+    private func processGNSSControlResponse(from data: Data) {
+        guard data.count >= 1 else {
+            print("Received empty GNSS Control response.")
+            DispatchQueue.main.async {
+                self.gnssMaskUpdateStatus = .failure("Empty response from device.")
+            }
+            return
+        }
+
+        let opcode = data[0]
+
+        if opcode == FlySightCore.GNSSControlOpcodes.getMask {
+            guard data.count >= 2 else {
+                print("Invalid GET_MASK response length.")
+                DispatchQueue.main.async {
+                    self.gnssMaskUpdateStatus = .failure("Invalid GET_MASK response.")
+                }
+                return
+            }
+            let mask = data[1]
+            DispatchQueue.main.async {
+                self.currentGNSSMask = mask
+                self.gnssMaskUpdateStatus = .success
+                print("Successfully fetched GNSS Mask: \(String(format: "0x%02X", mask))")
+            }
+        } else if opcode == FlySightCore.GNSSControlOpcodes.setMask {
+            guard data.count >= 2 else {
+                print("Invalid SET_MASK response length.")
+                DispatchQueue.main.async {
+                    self.gnssMaskUpdateStatus = .failure("Invalid SET_MASK response.")
+                }
+                return
+            }
+            let status = data[1]
+            DispatchQueue.main.async {
+                if status == FlySightCore.GNSSControlStatus.ok {
+                    // The currentGNSSMask would have been optimistically set or can be re-fetched.
+                    // For simplicity, we assume the write was for the value in currentGNSSMask.
+                    // Or, better, the value that was *sent* to be set.
+                    // For now, we'll just mark as success. The UI should reflect the requested change.
+                    self.gnssMaskUpdateStatus = .success
+                    print("Successfully set GNSS Mask.")
+                    // Optionally re-fetch to confirm: self.fetchGNSSMask()
+                } else if status == FlySightCore.GNSSControlStatus.badLength {
+                    self.gnssMaskUpdateStatus = .failure("Device reported bad length for SET_MASK.")
+                    print("Failed to set GNSS Mask: Bad Length")
+                } else if status == FlySightCore.GNSSControlStatus.badOpcode {
+                    self.gnssMaskUpdateStatus = .failure("Device reported bad opcode for SET_MASK.")
+                    print("Failed to set GNSS Mask: Bad Opcode")
+                } else {
+                    self.gnssMaskUpdateStatus = .failure("Unknown error from device (status: \(status)).")
+                    print("Failed to set GNSS Mask: Unknown error \(status)")
+                }
+            }
+        } else {
+            print("Received unknown opcode in GNSS Control response: \(opcode)")
+            DispatchQueue.main.async {
+                self.gnssMaskUpdateStatus = .failure("Unknown response from device.")
+            }
+        }
     }
 }
