@@ -19,22 +19,10 @@ public extension FlySightCore {
         public static let numSV: UInt8              = 0x04 // GNSS_BLE_BIT_NUM_SV
     }
 
-    // Constants for GNSS Control Opcodes and Status, matching firmware `gnss_ble.h`
-    struct GNSSControlOpcodes {
-        public static let setMask: UInt8            = 0x01 // GNSS_BLE_OP_SET_MASK
-        public static let getMask: UInt8            = 0x02 // GNSS_BLE_OP_GET_MASK
-    }
-
-    struct GNSSControlStatus {
-        public static let ok: UInt8                 = 0x00 // GNSS_BLE_STATUS_OK
-        public static let badLength: UInt8          = 0x01 // GNSS_BLE_STATUS_BAD_LENGTH
-        public static let badOpcode: UInt8          = 0x02 // GNSS_BLE_STATUS_BAD_OPCODE
-    }
-
     enum GNSSMaskUpdateStatus: Equatable {
         case idle
         case pending
-        case success
+        // case success // 'success' is now transiently handled and leads to 'idle'
         case failure(String)
     }
 }
