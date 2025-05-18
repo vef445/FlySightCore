@@ -20,16 +20,16 @@ public extension FlySightCore {
         public let CRS_RX_UUID = CBUUID(string: "00000002-8e22-4541-9d4c-21edae82ed19")
         public let CRS_TX_UUID = CBUUID(string: "00000001-8e22-4541-9d4c-21edae82ed19")
         public let GNSS_PV_UUID = CBUUID(string: "00000000-8e22-4541-9d4c-21edae82ed19")
-        public let START_CONTROL_UUID = CBUUID(string: "00000003-8e22-4541-9d4c-21edae82ed19")
         public let START_RESULT_UUID = CBUUID(string: "00000004-8e22-4541-9d4c-21edae82ed19")
-        public let GNSS_CONTROL_UUID = CBUUID(string: "00000006-8e22-4541-9d4c-21edae82ed19")
+        public let SD_CONTROL_POINT_UUID = CBUUID(string: "00000006-8e22-4541-9d4c-21edae82ed19")
+        public let SP_CONTROL_POINT_UUID = CBUUID(string: "00000003-8e22-4541-9d4c-21edae82ed19")
 
         private var rxCharacteristic: CBCharacteristic?
         private var txCharacteristic: CBCharacteristic?
         private var pvCharacteristic: CBCharacteristic?
-        private var controlCharacteristic: CBCharacteristic?
+        private var spControlPointCharacteristic: CBCharacteristic?
         private var resultCharacteristic: CBCharacteristic?
-        private var gnssControlCharacteristic: CBCharacteristic?
+        private var sdControlPointCharacteristic: CBCharacteristic?
 
         @Published public var directoryEntries: [DirectoryEntry] = []
 
@@ -219,27 +219,31 @@ public extension FlySightCore {
         }
 
         public func sendStartCommand() {
-            guard let controlCharacteristic = controlCharacteristic else {
-                print("Control characteristic not found")
+            guard let spControlChar = spControlPointCharacteristic else {
+                print("SP Control Point characteristic not found")
+                // Potentially provide feedback to the UI that the command cannot be sent
                 return
             }
 
-            // Sending 0x00 to the control characteristic
-            let startCommand = Data([0x00])
-            connectedPeripheral?.peripheral.writeValue(startCommand, for: controlCharacteristic, type: .withResponse)
-            state = .counting
+            // Sending 0x01 (SP_CMD_START_COUNTDOWN)
+            let startCommand = Data([FlySightCore.SPControlOpcodes.startCountdown])
+            connectedPeripheral?.peripheral.writeValue(startCommand, for: spControlChar, type: .withResponse) // .withResponse is okay; the app-level ack is the Indication
+            print("Sent Start command to SP Control Point.")
+            // State change to .counting will occur in processSPControlPointResponse upon successful indication.
         }
 
         public func sendCancelCommand() {
-            guard let controlCharacteristic = controlCharacteristic else {
-                print("Control characteristic not found")
+            guard let spControlChar = spControlPointCharacteristic else {
+                print("SP Control Point characteristic not found")
+                // Potentially provide feedback to the UI
                 return
             }
 
-            // Sending 0x01 to the control characteristic
-            let cancelCommand = Data([0x01])
-            connectedPeripheral?.peripheral.writeValue(cancelCommand, for: controlCharacteristic, type: .withResponse)
-            state = .idle
+            // Sending 0x02 (SP_CMD_CANCEL_COUNTDOWN)
+            let cancelCommand = Data([FlySightCore.SPControlOpcodes.cancelCountdown])
+            connectedPeripheral?.peripheral.writeValue(cancelCommand, for: spControlChar, type: .withResponse)
+            print("Sent Cancel command to SP Control Point.")
+            // State change to .idle will occur in processSPControlPointResponse upon successful indication.
         }
 
         public func processStartResult(data: Data) {
@@ -840,9 +844,9 @@ extension FlySightCore.BluetoothManager: CBCentralManagerDelegate {
         rxCharacteristic = nil
         txCharacteristic = nil
         pvCharacteristic = nil
-        controlCharacteristic = nil
+        spControlPointCharacteristic = nil
         resultCharacteristic = nil
-        gnssControlCharacteristic = nil
+        sdControlPointCharacteristic = nil
         lastAttemptedGNSSMask = nil
         DispatchQueue.main.async {
              self.gnssMaskUpdateStatus = .idle
@@ -872,10 +876,12 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
             print("Error reading characteristic: \(characteristic.uuid) - \(error?.localizedDescription ?? "Unknown error")")
 
             // If this error is for GNSS_CONTROL_UUID after a GET_MASK or SET_MASK attempt
-            if characteristic.uuid == GNSS_CONTROL_UUID {
+            if characteristic.uuid == SD_CONTROL_POINT_UUID { // <--- CORRECTED
                 DispatchQueue.main.async {
-                    self.gnssMaskUpdateStatus = .failure("Failed to read/receive update from GNSS Control: \(error?.localizedDescription ?? "Unknown error")")
+                    self.gnssMaskUpdateStatus = FlySightCore.GNSSMaskUpdateStatus.failure("Failed to read/receive update from SD Control Point: \(error?.localizedDescription ?? "Unknown error")")
                     self.lastAttemptedGNSSMask = nil
+                    // Optionally, re-fetch mask if appropriate here
+                    // if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
                 }
             }
 
@@ -903,18 +909,22 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
                 // If not a directory entry, it might be a file transfer packet,
                 // which will be handled by the notificationHandlers check below.
             }
-        } else if characteristic.uuid == START_RESULT_UUID {
+        } else if characteristic.uuid == START_RESULT_UUID { // This is for SP_Result
             processStartResult(data: data)
             handledBySpecificLogic = true
-            // print("Processed START_RESULT_UUID")
-        } else if characteristic.uuid == GNSS_PV_UUID {
+            // print("Processed START_RESULT_UUID (SP_Result)")
+        } else if characteristic.uuid == GNSS_PV_UUID { // This is SD_GNSS_Measurement
             parseLiveGNSSData(from: data)
             handledBySpecificLogic = true
-            // print("Processed GNSS_PV_UUID")
-        } else if characteristic.uuid == GNSS_CONTROL_UUID {
-            processGNSSControlResponse(from: data)
+            // print("Processed GNSS_PV_UUID (SD_GNSS_Measurement)")
+        } else if characteristic.uuid == SD_CONTROL_POINT_UUID { // Was GNSS_CONTROL_UUID
+            processSDControlPointResponse(from: data) // Call updated function
             handledBySpecificLogic = true
-            // print("Processed GNSS_CONTROL_UUID")
+            // print("Processed SD_CONTROL_POINT_UUID")
+        } else if characteristic.uuid == SP_CONTROL_POINT_UUID { // Was START_CONTROL_UUID, now for indications
+            processSPControlPointResponse(from: data) // Call new function
+            handledBySpecificLogic = true
+            // print("Processed SP_CONTROL_POINT_UUID")
         }
 
         // 3. Check for registered notification handlers (e.g., for file download/upload on CRS_TX_UUID)
@@ -929,20 +939,21 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
             // print("No specific logic or notification handler for characteristic \(characteristic.uuid). Data: \(data.hexEncodedString())")
         }
     }
-    
+	    
     public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             print("Write error for characteristic \(characteristic.uuid): \(error.localizedDescription)")
             if isUploading { // Existing logic for upload
                 cancelUpload()
             }
-            // Add this block for GNSS Control write error
-            if characteristic.uuid == GNSS_CONTROL_UUID {
+            if characteristic.uuid == SD_CONTROL_POINT_UUID { // Was GNSS_CONTROL_UUID
                 DispatchQueue.main.async {
-                    self.gnssMaskUpdateStatus = .failure("Write failed for GNSS Control: \(error.localizedDescription)")
+                    if self.gnssMaskUpdateStatus == .pending { // Only update if a request was actually pending
+                        self.gnssMaskUpdateStatus = .failure("Write failed for SD Control Point: \(error.localizedDescription)")
+                    }
                     self.lastAttemptedGNSSMask = nil // Clear any pending mask value
                     // Attempt to re-sync with the actual device state, as the write failed
-                    if self.connectedPeripheral != nil { self.fetchGNSSMask() }
+                    if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
                 }
             }
             return
@@ -1007,20 +1018,23 @@ extension FlySightCore.BluetoothManager: CBPeripheralDelegate {
                     pvCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic) // Enable notifications for PV
                     print("GNSS PV Characteristic found: \(characteristic.uuid)")
-                } else if characteristic.uuid == START_CONTROL_UUID {
-                    controlCharacteristic = characteristic
-                } else if characteristic.uuid == START_RESULT_UUID {
+                } else if characteristic.uuid == SP_CONTROL_POINT_UUID { // NEW (was START_CONTROL_UUID)
+                    spControlPointCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Enable indications
+                    print("SP Control Point Characteristic found: \(characteristic.uuid)")
+                } else if characteristic.uuid == START_RESULT_UUID { // This is SP_Result
                     resultCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic)
-                } else if characteristic.uuid == GNSS_CONTROL_UUID { // Add this block
-                    gnssControlCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic) // Enable notifications for GNSS Control
-                    print("GNSS Control Characteristic found: \(characteristic.uuid)")
-                    // Optionally, fetch the current mask once connected and characteristic is found
-                    // fetchGNSSMask() // Consider calling this after all essential characteristics are found
+                    print("SP Result Characteristic found: \(characteristic.uuid)")
+                } else if characteristic.uuid == SD_CONTROL_POINT_UUID { // NEW (was GNSS_CONTROL_UUID)
+                    sdControlPointCharacteristic = characteristic
+                    peripheral.setNotifyValue(true, for: characteristic) // Enable indications
+                    print("SD Control Point Characteristic found: \(characteristic.uuid)")
                 }
             }
-            if txCharacteristic != nil && rxCharacteristic != nil && pvCharacteristic != nil && gnssControlCharacteristic != nil && pingTimer == nil {
+            if txCharacteristic != nil && rxCharacteristic != nil && pvCharacteristic != nil &&
+               sdControlPointCharacteristic != nil && spControlPointCharacteristic != nil && resultCharacteristic != nil && // ensure all are found
+               pingTimer == nil {
                 loadDirectoryEntries()
                 startPingTimer()
                 fetchGNSSMask() // Good place to fetch initial mask
@@ -1056,42 +1070,41 @@ extension FlySightCore.BluetoothManager {
 
 extension FlySightCore.BluetoothManager {
     public func fetchGNSSMask() {
-        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = gnssControlCharacteristic else {
-            print("Cannot fetch GNSS mask: No connected peripheral or GNSS Control characteristic.")
-            DispatchQueue.main.async { // Ensure UI updates are on main thread
-                self.gnssMaskUpdateStatus = .failure("GNSS Control characteristic not available.")
+        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = sdControlPointCharacteristic else { // Use sdControlPointCharacteristic
+            print("Cannot fetch GNSS mask: No connected peripheral or SD Control Point characteristic.")
+            DispatchQueue.main.async {
+                self.gnssMaskUpdateStatus = .failure("SD Control Point characteristic not available.")
             }
             return
         }
 
-        let command = Data([FlySightCore.GNSSControlOpcodes.getMask])
+        let command = Data([FlySightCore.SDControlOpcodes.getMask]) // Use SDControlOpcodes
         print("Fetching GNSS Mask...")
-        DispatchQueue.main.async { // Ensure UI updates are on main thread
+        DispatchQueue.main.async {
             self.gnssMaskUpdateStatus = .pending
         }
         peripheral.writeValue(command, for: controlChar, type: .withResponse)
     }
 
     public func updateGNSSMask(newMask: UInt8) {
-        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = gnssControlCharacteristic else {
-            print("Cannot update GNSS mask: No connected peripheral or GNSS Control characteristic.")
-            DispatchQueue.main.async { // Ensure UI updates are on main thread
-                self.gnssMaskUpdateStatus = .failure("GNSS Control characteristic not available.")
+        guard let peripheral = connectedPeripheral?.peripheral, let controlChar = sdControlPointCharacteristic else { // Use sdControlPointCharacteristic
+            print("Cannot update GNSS mask: No connected peripheral or SD Control Point characteristic.")
+            DispatchQueue.main.async {
+                self.gnssMaskUpdateStatus = .failure("SD Control Point characteristic not available.")
             }
             return
         }
 
-        // Store the mask we are attempting to set
         self.lastAttemptedGNSSMask = newMask
 
-        let command = Data([FlySightCore.GNSSControlOpcodes.setMask, newMask])
+        let command = Data([FlySightCore.SDControlOpcodes.setMask, newMask]) // Use SDControlOpcodes
         print("Attempting to update GNSS Mask to: \(String(format: "0x%02X", newMask))")
-        DispatchQueue.main.async { // Ensure UI updates are on main thread
+        DispatchQueue.main.async {
             self.gnssMaskUpdateStatus = .pending
         }
         peripheral.writeValue(command, for: controlChar, type: .withResponse)
     }
-
+    
     private func parseLiveGNSSData(from data: Data) {
         guard data.count > 0 else {
             print("Received empty GNSS PV data.")
@@ -1179,78 +1192,132 @@ extension FlySightCore.BluetoothManager {
         }
     }
 
-    private func processGNSSControlResponse(from data: Data) {
-        guard data.count >= 1 else {
-            print("Received empty GNSS Control response.")
+    private func processSDControlPointResponse(from data: Data) {
+        guard data.count >= 3, data[0] == FlySightCore.CP_RESPONSE_ID else {
+            print("Invalid SD Control Point response: Missing 0xF0 prefix or too short. Data: \(data.hexEncodedString())")
             DispatchQueue.main.async {
-                self.gnssMaskUpdateStatus = .failure("Empty response from device.")
-                self.lastAttemptedGNSSMask = nil // Clear pending mask
-                // Attempt to re-sync with the actual device state
-                if self.connectedPeripheral != nil { self.fetchGNSSMask() }
+                if self.gnssMaskUpdateStatus == .pending { // Only update if a request was actually pending
+                    self.gnssMaskUpdateStatus = .failure("Invalid response format from device.")
+                }
+                self.lastAttemptedGNSSMask = nil
+                // Avoid fetch storm if not connected or characteristic is nil
+                if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil {
+                    self.fetchGNSSMask() // Attempt to re-sync
+                }
             }
             return
         }
 
-        let opcode = data[0]
+        let requestOpcode = data[1]
+        let status = data[2]
 
-        if opcode == FlySightCore.GNSSControlOpcodes.getMask {
-            guard data.count >= 2 else {
-                print("Invalid GET_MASK response length.")
+        // Handle GET_MASK response
+        if requestOpcode == FlySightCore.SDControlOpcodes.getMask {
+            guard status == FlySightCore.CP_STATUS.success else {
+                print("GET_MASK failed with status: \(status)")
                 DispatchQueue.main.async {
-                    self.gnssMaskUpdateStatus = .failure("Invalid GET_MASK response.")
+                    if self.gnssMaskUpdateStatus == .pending {
+                        self.gnssMaskUpdateStatus = .failure("GET_MASK failed (status: \(status)).")
+                    }
                 }
                 return
             }
-            let mask = data[1]
+            guard data.count >= 4 else { // 0xF0, Opcode, Status, MaskValue == 4 bytes
+                print("Invalid GET_MASK response length (after 0xF0 prefix). Expected at least 4 bytes. Data: \(data.hexEncodedString())")
+                DispatchQueue.main.async {
+                    if self.gnssMaskUpdateStatus == .pending {
+                        self.gnssMaskUpdateStatus = .failure("Invalid GET_MASK response length.")
+                    }
+                }
+                return
+            }
+            let mask = data[3]
             DispatchQueue.main.async {
                 self.currentGNSSMask = mask
-                self.gnssMaskUpdateStatus = .idle // Changed from .success to .idle as per no-dialog flow
+                self.gnssMaskUpdateStatus = .idle // Success, now idle
                 print("Successfully fetched GNSS Mask: \(String(format: "0x%02X", mask))")
             }
-        } else if opcode == FlySightCore.GNSSControlOpcodes.setMask {
-            guard data.count >= 2 else {
-                print("Invalid SET_MASK response length.")
-                DispatchQueue.main.async {
-                    self.gnssMaskUpdateStatus = .failure("Invalid SET_MASK response.")
-                    self.lastAttemptedGNSSMask = nil // Clear pending mask
-                    // Attempt to re-sync
-                    if self.connectedPeripheral != nil { self.fetchGNSSMask() }
-                }
-                return
-            }
-            let status = data[1]
+        }
+        // Handle SET_MASK response
+        else if requestOpcode == FlySightCore.SDControlOpcodes.setMask {
             DispatchQueue.main.async {
-                if status == FlySightCore.GNSSControlStatus.ok {
+                if status == FlySightCore.CP_STATUS.success {
                     if let attemptedMask = self.lastAttemptedGNSSMask {
-                        self.currentGNSSMask = attemptedMask // Update currentGNSSMask with the successfully set value
+                        self.currentGNSSMask = attemptedMask // Update with the successfully set value
                         print("Successfully set GNSS Mask to: \(String(format: "0x%02X", attemptedMask))")
                     } else {
                         // This case should ideally not happen if lastAttemptedGNSSMask was set.
-                        // Fetch to be sure.
-                        if self.connectedPeripheral != nil { self.fetchGNSSMask() }
+                        if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
                         print("Successfully set GNSS Mask, but last attempted mask was nil. Re-fetching.")
                     }
-                    self.gnssMaskUpdateStatus = .idle // Changed from .success to .idle
+                    self.gnssMaskUpdateStatus = .idle // Success, now idle
                 } else {
-                    var errorMsg = "Unknown error from device (status: \(status))."
-                    if status == FlySightCore.GNSSControlStatus.badLength {
-                        errorMsg = "Device reported bad length for SET_MASK."
-                        print("Failed to set GNSS Mask: Bad Length")
-                    } else if status == FlySightCore.GNSSControlStatus.badOpcode {
-                        errorMsg = "Device reported bad opcode for SET_MASK."
-                        print("Failed to set GNSS Mask: Bad Opcode")
+                    var errorMsg = "SET_MASK failed (status: \(status))."
+                    if status == FlySightCore.CP_STATUS.invalidParameter { errorMsg = "SET_MASK failed: Invalid Parameter." }
+                    else if status == FlySightCore.CP_STATUS.operationNotPermitted { errorMsg = "SET_MASK failed: Operation Not Permitted." }
+                    else if status == FlySightCore.CP_STATUS.busy { errorMsg = "SET_MASK failed: Device Busy." }
+                    else if status == FlySightCore.CP_STATUS.cmdNotSupported { errorMsg = "SET_MASK failed: Command Not Supported." }
+
+
+                    print("Failed to set GNSS Mask: \(errorMsg)")
+                    if self.gnssMaskUpdateStatus == .pending {
+                        self.gnssMaskUpdateStatus = .failure(errorMsg)
                     }
-                    self.gnssMaskUpdateStatus = .failure(errorMsg)
                     // If SET_MASK failed, re-fetch the actual current mask from the device
-                    if self.connectedPeripheral != nil { self.fetchGNSSMask() }
+                    if self.connectedPeripheral?.peripheral != nil && self.sdControlPointCharacteristic != nil { self.fetchGNSSMask() }
                 }
                 self.lastAttemptedGNSSMask = nil // Clear the stored attempted mask
             }
         } else {
-            print("Received unknown opcode in GNSS Control response: \(opcode)")
+            print("Received unknown opcode \(requestOpcode) in SD Control Point response: \(data.hexEncodedString())")
             DispatchQueue.main.async {
-                self.gnssMaskUpdateStatus = .failure("Unknown response from device.")
-                self.lastAttemptedGNSSMask = nil // Clear pending mask
+                if self.gnssMaskUpdateStatus == .pending {
+                    self.gnssMaskUpdateStatus = .failure("Unknown response opcode from device.")
+                }
+                self.lastAttemptedGNSSMask = nil
+            }
+        }
+    }
+
+    private func processSPControlPointResponse(from data: Data) {
+        guard data.count >= 3, data[0] == FlySightCore.CP_RESPONSE_ID else {
+            print("Invalid SP Control Point response: Missing 0xF0 prefix or too short. Data: \(data.hexEncodedString())")
+            // If a command was expected, this is an error.
+            // Consider updating state if it was optimistically set.
+            // For now, just log. The UI relies on `self.state`.
+            return
+        }
+
+        let requestOpcode = data[1]
+        let status = data[2]
+
+        DispatchQueue.main.async {
+            if requestOpcode == FlySightCore.SPControlOpcodes.startCountdown {
+                if status == FlySightCore.CP_STATUS.success {
+                    print("Start Countdown command acknowledged successfully.")
+                    self.state = .counting // Update state on successful ACK
+                } else {
+                    print("Start Countdown command failed with status: \(status). Current state: \(self.state)")
+                    // If start fails, and we weren't already successfully counting (e.g. from a button press on device itself),
+                    // ensure state is idle.
+                    if self.state != .counting {
+                       self.state = .idle
+                    }
+                    // Optionally publish an error message for the UI
+                }
+            } else if requestOpcode == FlySightCore.SPControlOpcodes.cancelCountdown {
+                if status == FlySightCore.CP_STATUS.success {
+                    print("Cancel Countdown command acknowledged successfully.")
+                    self.state = .idle // Update state on successful ACK
+                    self.startResultDate = nil // Clear any pending/received start result if cancel is confirmed by FlySight
+                } else {
+                    print("Cancel Countdown command failed with status: \(status). Current state: \(self.state)")
+                    // If cancel fails, we are likely still in .counting state.
+                    // No change to self.state here, as a failed cancel means the device might still be counting.
+                    // Optionally publish an error message for the UI
+                }
+            } else {
+                print("Received unknown opcode \(requestOpcode) in SP Control Point response: \(data.hexEncodedString())")
             }
         }
     }
