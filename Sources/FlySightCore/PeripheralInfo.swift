@@ -9,7 +9,7 @@ import Foundation
 import CoreBluetooth
 
 public extension FlySightCore {
-    struct PeripheralInfo: Identifiable, Equatable {
+    struct PeripheralInfo: Identifiable {
         public let peripheral: CBPeripheral
         public var rssi: Int
         public var name: String
